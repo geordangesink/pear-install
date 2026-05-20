@@ -1,6 +1,6 @@
 {
   "name": "pear-install",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "main": "index.js",
   "type": "commonjs",
   "description": "Install Pear and Pear Applications",
