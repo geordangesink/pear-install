@@ -30,3 +30,25 @@ jobs:
     steps:
       - uses: holepunchto/actions/bare-base@v1
       - run: npm test
+
+  install-e2e:
+    name: pear-install e2e / ${{ matrix.platform }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: macos-latest
+            platform: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      PEAR_INSTALL_E2E: '1'
+    steps:
+      - uses: holepunchto/actions/bare-base@v1
+      - name: Install Bare
+        run: npm i -g bare-runtime
+      - name: Test pear-install e2e
+        run: npx brittle-node test/e2e.test.js
