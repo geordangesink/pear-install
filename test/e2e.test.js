@@ -36,7 +36,8 @@ test(
     }
     await fs.promises.mkdir(homeDir, { recursive: true })
     t.teardown(() => cleanupProcesses(dir, homeDir, existingSidecars))
-
+    // TODO: once we have an actual release on a key we can replace a big chuck
+    // and run on a published key instead of main branch
     t.comment('clone pear')
     await exec(t, 'git', ['clone', '--depth', '1', pearRepo, pearDir], { env })
 
