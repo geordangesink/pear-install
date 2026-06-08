@@ -14,7 +14,7 @@ jobs:
       - uses: holepunchto/actions/node-base@v1
       - run: npm run lint
 
-  test-node:
+  test:
     strategy:
       matrix:
         include:
@@ -25,25 +25,8 @@ jobs:
           - os: windows-latest
             platform: win32
     runs-on: ${{ matrix.os }}
-    name: Test with Node / ${{ matrix.platform }}
-    timeout-minutes: 45
-    steps:
-      - uses: holepunchto/actions/node-base@v1
-      - run: npm run test:node
-
-  test-bare:
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux
-          - os: macos-latest
-            platform: darwin
-          - os: windows-latest
-            platform: win32
-    runs-on: ${{ matrix.os }}
-    name: Test with Bare / ${{ matrix.platform }}
+    name: Test / ${{ matrix.platform }}
     timeout-minutes: 2
     steps:
       - uses: holepunchto/actions/bare-base@v1
-      - run: npm run test:bare
+      - run: npm test

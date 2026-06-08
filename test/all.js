@@ -8,7 +8,7 @@ async function runTests() {
   test.pause()
 
   await import('./index.test.js')
-  if (typeof Bare === 'undefined') await import('./e2e.test.js')
+  await import('./e2e.test.js')
 
   test.resume()
 }
