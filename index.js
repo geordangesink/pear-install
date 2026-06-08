@@ -72,19 +72,9 @@ class Install extends ReadyResource {
 
     await this.drive.ready()
     this.doneFinding = this.drive.findingPeers()
-    const topic = this.swarm.join(this.drive.discoveryKey, { server: false, client: true })
+    this.swarm.join(this.drive.discoveryKey, { server: false, client: true })
     this.swarm.on('connection', (c) => this.corestore.replicate(c))
 
-    let serving = false
-    this.swarm.dht.on('nat-update', () => {
-      if (!this.swarm.dht.randomized && !serving) {
-        serving = true
-        this.swarm
-          .join(this.drive.discoveryKey, { server: true, client: false })
-          .flushed()
-          .then(() => topic.destroy())
-      }
-    })
     const deferred = Promise.withResolvers()
     const countdown = setTimeout(() => {
       deferred.reject(ERR_NETWORK_TIMEOUT('Network Timeout ' + timeout / 1000 + 's'))
@@ -107,11 +97,9 @@ class Install extends ReadyResource {
         const ext = isWindows ? '.exe' : ''
         const dest = to
           ? path.join(to, binName + ext)
-          : isMac
-            ? path.join('/', 'usr', 'local', 'bin', binName)
-            : isWindows
-              ? path.join(localAppData, 'Programs', appName, binName + ext)
-              : path.join(home, '.local', 'bin', binName)
+          : isWindows
+            ? path.join(localAppData, 'Programs', appName, binName + ext)
+            : path.join(home, '.local', 'bin', binName)
         this.targets.push({ filename: binName, ext, dest, isBin: true })
       }
     }
@@ -230,24 +218,19 @@ class Install extends ReadyResource {
         } catch (err) {
           if (err.code === 'EACCES' || err.code === 'EPERM') {
             const dir = path.dirname(dest)
-            const fix = isMac
-              ? `sudo chgrp admin ${dir} && sudo chmod g+w ${dir}`
-              : `sudo chown -R "$(id -un):$(id -gn)" ${dir}`
-            throw ERR_PERMISSION_REQUIRED(`Permission denied: ${dest}\n  Fix: ${fix}`)
+            throw ERR_PERMISSION_REQUIRED(`Permission denied: ${dest}\n`)
           }
           throw err
         }
         fs.chmodSync(dest, 0o755)
+        if (!isWindows) this._addToPath(path.join(os.homedir(), '.local', 'bin'))
       } else {
         try {
           await fs.promises.rename(from, dest)
         } catch (err) {
           if (err.code === 'EACCES' || err.code === 'EPERM') {
             const dir = path.dirname(dest)
-            const fix = isMac
-              ? `sudo chgrp admin ${dir} && sudo chmod g+w ${dir}`
-              : `sudo chown -R "$(id -un):$(id -gn)" ${dir}`
-            throw ERR_PERMISSION_REQUIRED(`Permission denied: ${dest}\n  Fix: ${fix}`)
+            throw ERR_PERMISSION_REQUIRED(`Permission denied: ${dest}\n`)
           }
           throw err
         }
@@ -373,6 +356,43 @@ class Install extends ReadyResource {
       } catch {}
       this.base = null
     }
+  }
+
+  _addToPath(newPath) {
+    const { configFile, shell } = this._detectShellConfig()
+
+    const isFish = shell === 'fish'
+    const exportLine = isFish ? `\nfish_add_path ${newPath}` : `\nexport PATH="$PATH:${newPath}"`
+
+    const content = fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : ''
+    if (process.env.PATH.split(':').includes(newPath) || content.includes(exportLine)) {
+      return
+    }
+
+    fs.appendFileSync(configFile, exportLine + '\n', 'utf8')
+  }
+
+  _detectShellConfig() {
+    const home = os.homedir()
+    const shell = path.basename(process.env.SHELL)
+
+    const configCandidates = {
+      zsh: ['.zshrc', '.zprofile'],
+      bash: isMac
+        ? ['.bash_profile', '.bashrc', '.profile']
+        : ['.bashrc', '.bash_profile', '.profile'],
+      fish: ['.config/fish/config.fish'],
+      ksh: ['.kshrc', '.profile'],
+      tcsh: ['.tcshrc', '.cshrc'],
+      csh: ['.cshrc', '.tcshrc'],
+      sh: ['.profile']
+    }
+
+    const candidates = configCandidates[shell] ?? ['.profile']
+    const existing = candidates.find((f) => fs.existsSync(path.join(home, f)))
+    const configFile = path.join(home, existing ?? candidates[0])
+
+    return { configFile, shell }
   }
 }
 
