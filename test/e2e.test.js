@@ -2,14 +2,13 @@
 const test = require('brittle')
 const path = require('path')
 const fs = require('fs')
-const { spawn, spawnSync } = require('child_process')
+const { spawn } = require('child_process')
 const process = require('process')
 const tmp = require('test-tmp')
-const LocalDrive = require('localdrive')
 const pearBuild = require('pear-build')
 const { platform, arch, isWindows } = require('which-runtime')
+const InstallCmd = require('../cmd')
 
-const root = path.dirname(__dirname)
 const npm = isWindows ? 'npm.cmd' : 'npm'
 const pearDev = isWindows ? 'pear.dev.cmd' : './pear.dev'
 const pearExe = isWindows ? 'pear.exe' : 'pear'
@@ -28,14 +27,12 @@ test(
     const buildDir = path.join(pearDir, 'out', 'build')
     const homeDir = path.join(dir, 'home')
     const installedPear = path.join(installDir, pearExe)
-    const existingSidecars = pearSidecarPids()
     const env = {
       ...process.env,
       HOME: homeDir,
       PATH: `${installDir}${path.delimiter}${process.env.PATH || ''}`
     }
     await fs.promises.mkdir(homeDir, { recursive: true })
-    t.teardown(() => cleanupProcesses(dir, homeDir, existingSidecars))
     // TODO: once we have an actual release on a key we can replace a big chuck
     // and run on a published key instead of main branch
     t.comment('clone pear')
@@ -44,20 +41,10 @@ test(
     t.comment('install pear dependencies')
     await exec(t, npm, ['install'], { cwd: pearDir, env })
 
-    t.comment('use local pear-install checkout')
-    await new LocalDrive(root)
-      .mirror(new LocalDrive(path.join(pearDir, 'node_modules', 'pear-install')), {
-        prune: true,
-        ignore: ['/node_modules', '/.git', '/coverage']
-      })
-      .done()
-
-    t.comment('touch pear upgrade link')
     const touch = await exec(t, pearDev, ['touch', '--json'], { cwd: pearDir, env })
     const link = findJson(touch.stdout, 'touch', 'final')?.data?.link
     t.ok(link, `touched ${link}`)
 
-    t.comment('replace package upgrade links')
     const pkgPath = path.join(pearDir, 'package.json')
     const pkg = JSON.parse(await fs.promises.readFile(pkgPath, 'utf8'))
     pkg.upgrade.production = link
@@ -89,20 +76,18 @@ test(
     const seed = spawn(pearDev, ['seed', link, '--json', '--no-tty'], {
       cwd: pearDir,
       env,
-      detached: !isWindows,
       stdio: ['ignore', 'pipe', 'pipe']
     })
-    seed.killGroup = !isWindows
     t.teardown(() => terminate(seed))
     await waitForJson(seed, 'seed', 'announced')
 
     t.comment('install pear')
     await fs.promises.mkdir(installDir, { recursive: true })
-    const install = await exec(t, pearDev, ['install', '--to', installDir, '--json', link], {
-      cwd: pearDir,
-      env
-    })
-    t.ok(findJson(install.stdout, 'install', 'final')?.data?.success, 'installed successfully')
+    let finalInstall = null
+    for await (const event of new InstallCmd({ link, to: installDir, timeout: 120_000 })) {
+      if (event.tag === 'final') finalInstall = event.data
+    }
+    t.ok(finalInstall?.success, 'installed successfully')
 
     t.comment('run installed pear smoke tests')
     t.ok(fs.existsSync(installedPear), `installed ${installedPear}`)
@@ -113,10 +98,8 @@ test(
     const sidecar = spawn(installedPear, ['sidecar'], {
       cwd: dir,
       env,
-      detached: !isWindows,
       stdio: ['ignore', 'pipe', 'pipe']
     })
-    sidecar.killGroup = !isWindows
     t.teardown(() => terminate(sidecar))
     t.teardown(() =>
       shutdownSidecar(t, installedPear, {
@@ -129,7 +112,6 @@ test(
     await shutdownSidecar(t, installedPear, { cwd: dir, env })
     await terminate(sidecar)
     await terminate(seed)
-    await cleanupProcesses(dir, homeDir, existingSidecars)
   }
 )
 
@@ -258,20 +240,23 @@ function waitForOutput(child, pattern, timeout = 120_000) {
 }
 
 async function terminate(child) {
-  if (!child || child.exitCode !== null) return
-  signal(child, 'SIGTERM')
+  if (!child) return
+  try {
+    child.kill('SIGTERM')
+  } catch {}
   const exited = await waitForExit(child, 5000)
-  if (exited) return
-  signal(child, 'SIGKILL')
+  if (exited) return closeStdio(child)
+  try {
+    child.kill('SIGKILL')
+  } catch {}
   await waitForExit(child, 5000)
+  closeStdio(child)
 }
 
-function signal(child, name) {
-  const pid = child.pid
-  if (!pid) return
-  try {
-    process.kill(child.killGroup ? -pid : pid, name)
-  } catch {}
+function closeStdio(child) {
+  child.stdin?.destroy?.()
+  child.stdout?.destroy?.()
+  child.stderr?.destroy?.()
 }
 
 function waitForExit(child, timeout) {
@@ -292,58 +277,5 @@ function waitForExit(child, timeout) {
 async function shutdownSidecar(t, cmd, opts) {
   try {
     await exec(t, cmd, ['sidecar', 'shutdown'], { ...opts, timeout: 30_000 })
-  } catch {}
-}
-
-async function cleanupProcesses(dir, homeDir, existingSidecars) {
-  const pids = new Set()
-  collectMatchingPids(pids, dir)
-  collectOpenFilePids(pids, homeDir)
-  collectNewSidecarPids(pids, existingSidecars)
-  pids.delete(String(process.pid))
-
-  for (const pid of pids) killPid(pid, 'SIGTERM')
-  if (pids.size > 0) await new Promise((resolve) => setTimeout(resolve, 1000))
-  for (const pid of pids) killPid(pid, 'SIGKILL')
-}
-
-function collectNewSidecarPids(pids, existing) {
-  for (const pid of pearSidecarPids()) {
-    if (!existing.has(pid)) pids.add(pid)
-  }
-}
-
-function pearSidecarPids() {
-  const pids = new Set()
-  const ps = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' })
-  if (ps.status !== 0) return pids
-  for (const line of ps.stdout.split(/\r?\n/)) {
-    const match = line.match(/^\s*(\d+)\s+(.+)$/)
-    if (match && match[2].trim() === 'pear-sidecar') pids.add(match[1])
-  }
-  return pids
-}
-
-function collectMatchingPids(pids, dir) {
-  const ps = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' })
-  if (ps.status !== 0) return
-  for (const line of ps.stdout.split(/\r?\n/)) {
-    const match = line.match(/^\s*(\d+)\s+(.*)$/)
-    if (!match) continue
-    if (match[2].includes(dir)) pids.add(match[1])
-  }
-}
-
-function collectOpenFilePids(pids, dir) {
-  const lsof = spawnSync('lsof', ['-t', '+D', dir], { encoding: 'utf8' })
-  if (lsof.status !== 0 && lsof.status !== 1) return
-  for (const line of lsof.stdout.split(/\r?\n/)) {
-    if (/^\d+$/.test(line)) pids.add(line)
-  }
-}
-
-function killPid(pid, signal) {
-  try {
-    process.kill(Number(pid), signal)
   } catch {}
 }
