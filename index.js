@@ -38,6 +38,7 @@ class Install extends ReadyResource {
     this.to = to
     this.bootstrap = bootstrap
     this.timeout = timeout
+    this.state = null
     this.targets = []
     this.base = null
     this.drive = null
@@ -58,9 +59,36 @@ class Install extends ReadyResource {
     const { link, only, to, bootstrap, timeout = 30_000 } = this
     const parsed = plink.parse(link)
     if (parsed.pathname) throw new Error('Link must not have pathname')
+
     const host = process.platform + '-' + process.arch
     this.emit('installing', { link, host })
 
+    await this._openDrive({ bootstrap, timeout, parsed })
+    this.state = await this._readManifestState()
+    const { bin, name } = this.state
+    const appPath = '/by-arch/' + host + '/app/'
+    const present = await this._readDriveContents(appPath)
+
+    this.targets = this._resolveTargets()
+    this._assertRequiredTargets({
+      appPath,
+      hasBin: !!bin,
+      only,
+      parsed,
+      present,
+      targets: this.targets
+    })
+    this.targets = this.targets.filter(({ filename, ext }) => present.has(filename + ext))
+
+    const { exists, toInstall } = this._partitionTargets(this.targets, name)
+
+    const tmp = await this._mirrorTargets(appPath, toInstall)
+    const installed = await this._installTargets({ appPath, host, toInstall, parsed, tmp })
+
+    this.emit('final', { success: true, installed, exists })
+  }
+
+  async _openDrive({ bootstrap, timeout, parsed }) {
     const rand = crypto.randomBytes(16).toString('hex')
     this.base = path.join(PEAR_DIR, 'gc', rand)
     fs.mkdirSync(this.base, { recursive: true })
@@ -75,21 +103,41 @@ class Install extends ReadyResource {
     this.swarm.join(this.drive.discoveryKey, { server: false, client: true })
     this.swarm.on('connection', (c) => this.corestore.replicate(c))
 
+    await this._waitForUpdate(timeout)
+  }
+
+  async _waitForUpdate(timeout = this.timeout) {
     const deferred = Promise.withResolvers()
     const countdown = setTimeout(() => {
       deferred.reject(ERR_NETWORK_TIMEOUT('Network Timeout ' + timeout / 1000 + 's'))
     }, timeout)
+
     await Promise.race([this.drive.core.update({ wait: true }), deferred.promise])
     clearTimeout(countdown)
+  }
+
+  async _readManifestState() {
     const pkg = await this.drive.get('/package.json')
     if (pkg === null) throw ERR_INVALID_MANIFEST('Unable to read application package.json')
     const manifest = JSON.parse(pkg.toString())
-
     const { name, productName, version, upgrade, bin } = manifest
-    const appName = productName ?? name
     const home = os.homedir()
+    return {
+      appName: productName ?? name,
+      bin,
+      home,
+      localAppData: process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'),
+      name,
+      upgrade,
+      version
+    }
+  }
 
-    const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local')
+  _resolveTargets() {
+    const { appName, bin, home, localAppData, name } = this.state
+    const to = this.to
+
+    const targets = []
 
     if (bin) {
       const bins = typeof bin === 'string' ? { [name]: bin } : bin
@@ -100,7 +148,7 @@ class Install extends ReadyResource {
           : isWindows
             ? path.join(localAppData, 'Programs', appName, binName + ext)
             : path.join(home, '.local', 'bin', binName)
-        this.targets.push({ filename: binName, ext, dest, isBin: true })
+        targets.push({ filename: binName, ext, dest, isBin: true })
       }
     }
 
@@ -117,60 +165,73 @@ class Install extends ReadyResource {
               ? path.join(home, 'AppImages', appName + ext)
               : path.join(home, '.local', 'bin', appName + ext)
 
-    this.targets.push({ filename: appName, ext, dest, isBin: false })
+    targets.push({ filename: appName, ext, dest, isBin: false })
+    return targets
+  }
 
+  async _readDriveContents(appPath) {
     const present = new Set()
-    const appPath = '/by-arch/' + host + '/app/'
     for await (const name of this.drive.readdir(appPath)) present.add(name)
+    return present
+  }
 
+  _assertRequiredTargets({ appPath, hasBin, only, parsed, present, targets }) {
     const required = only
       ? only
           .split(',')
           .map((s) => s.trim())
           .filter(Boolean)
-      : this.targets.filter((t) => t.isBin || !bin).map((t) => t.filename + t.ext)
+      : targets
+          .filter((target) => target.isBin || !hasBin)
+          .map(({ filename, ext }) => filename + ext)
+
     const missing = required
-      .filter((r) => !present.has(r))
+      .filter((name) => !present.has(name))
       .map((name) => plink.serialize({ ...parsed, pathname: appPath + name }))
-    if (missing.length) {
-      throw ERR_NOT_FOUND('Not found: ' + missing.join(', '))
-    }
 
-    this.targets = this.targets.filter(({ filename, ext }) => present.has(filename + ext))
+    if (missing.length) throw ERR_NOT_FOUND('Not found: ' + missing.join(', '))
+  }
 
+  _partitionTargets(targets, name) {
     const exists = []
-    const installs = []
-    for (const target of this.targets) {
-      if (target.ext === '.msix') {
-        const escName = name.replace(/'/g, "''")
-        const ps = spawnSync('powershell', [
-          '-NoProfile',
-          '-Command',
-          `$null -ne (Get-AppxPackage -Name '${escName}' -ErrorAction SilentlyContinue)`
-        ])
-        if (ps.stdout.toString().trim() === 'True') {
-          exists.push({ filename: target.filename, dest: target.dest, ext: target.ext })
-          continue
-        }
-      } else if (fs.existsSync(target.dest)) {
+    const toInstall = []
+
+    for (const target of targets) {
+      if (target.ext === '.msix' ? this._hasInstalledMsix(name) : fs.existsSync(target.dest)) {
         exists.push({ filename: target.filename, dest: target.dest, ext: target.ext })
         continue
       }
-      installs.push(target)
+
+      toInstall.push(target)
     }
 
-    if (installs.length === 0) {
+    if (toInstall.length === 0) {
       const lines = exists.map(({ filename, dest }) => '  ' + (dest ?? filename))
       const header = isWindows ? 'Already installed:' : 'Refusing to overwrite existing:'
-      const message = `${header}\n${lines.join('\n')}\nTo reinstall, manually remove then rerun command`
-      throw ERR_EXISTS(message)
+      throw ERR_EXISTS(
+        `${header}\n${lines.join('\n')}\nTo reinstall, manually remove then rerun command`
+      )
     }
 
+    return { exists, toInstall }
+  }
+
+  _hasInstalledMsix(name) {
+    const escName = name.replace(/'/g, "''")
+    const ps = spawnSync('powershell', [
+      '-NoProfile',
+      '-Command',
+      `$null -ne (Get-AppxPackage -Name '${escName}' -ErrorAction SilentlyContinue)`
+    ])
+    return ps.stdout.toString().trim() === 'True'
+  }
+
+  async _mirrorTargets(appPath, toInstall) {
     const tmp = path.join(this.base, 'targets')
     fs.mkdirSync(tmp, { recursive: true })
-    const prefixes = installs.map(({ filename, ext }) => appPath + filename + ext)
+
     const mirror = this.drive.mirror(new LocalDrive(tmp), {
-      prefix: prefixes,
+      prefix: toInstall.map(({ filename, ext }) => appPath + filename + ext),
       prune: false,
       progress: true,
       dedup: true
@@ -180,77 +241,88 @@ class Install extends ReadyResource {
     await mirror.done()
     monitor.destroy()
 
-    let installed = 0
-    const exes = new Set()
-    for (const { filename, ext, dest, isBin } of installs) {
-      const key = appPath + filename + ext
-      const verlink = plink.serialize({ drive: this.drive.core })
-      this.emit('app', {
-        app: filename,
-        name,
-        version,
-        upgrade,
-        verlink,
-        key,
-        tmp,
-        dest
-      })
-
-      const from = path.join(tmp, 'by-arch', host, 'app', filename + ext)
-
-      if (fs.existsSync(from) === false) {
-        throw ERR_NOT_FOUND(plink.serialize({ ...parsed, pathname: key }))
-      }
-
-      if (ext === '.msix') {
-        const MSIXManager = require('msix-manager')
-        await new MSIXManager().addPackage(from)
-        installed++
-        continue
-      } else if (ext === '.exe') {
-        exes.add(dest)
-      }
-
-      if (isBin) {
-        try {
-          if (!to) fs.mkdirSync(path.dirname(dest), { recursive: true })
-          this._move(from, dest)
-        } catch (err) {
-          if (err.code === 'EACCES' || err.code === 'EPERM') {
-            const dir = path.dirname(dest)
-            throw ERR_PERMISSION_REQUIRED(`Permission denied: ${dest}\n`)
-          }
-          throw err
-        }
-        fs.chmodSync(dest, 0o755)
-        if (!isWindows) this._addToPath(path.join(os.homedir(), '.local', 'bin'))
-      } else {
-        try {
-          await fs.promises.rename(from, dest)
-        } catch (err) {
-          if (err.code === 'EACCES' || err.code === 'EPERM') {
-            const dir = path.dirname(dest)
-            throw ERR_PERMISSION_REQUIRED(`Permission denied: ${dest}\n`)
-          }
-          throw err
-        }
-        if (isLinux) await this._linux(dest, filename, tmp, home)
-      }
-      installed++
-    }
-    if (installed === 0) {
-      throw ERR_UNKNOWN('Failed to install')
-    }
-
-    for (const dest of exes) this._exe(path.dirname(dest))
-
-    this.emit('final', { success: true, installed, exists })
+    return tmp
   }
 
-  async _linux(dest, appName, tmp, home) {
+  async _installTargets({ appPath, host, toInstall, parsed, tmp }) {
+    let installed = 0
+    const exes = new Set()
+
+    for (const target of toInstall) {
+      await this._installTarget({ appPath, exes, host, parsed, target, tmp })
+      installed++
+    }
+
+    for (const dest of exes) this._addExeToPath(path.dirname(dest))
+
+    if (installed === 0) throw ERR_UNKNOWN('Failed to install')
+
+    return installed
+  }
+
+  async _installTarget({ appPath, exes, host, parsed, target, tmp }) {
+    const { filename, ext, dest, isBin } = target
+    const {
+      state: { home, name, upgrade, version }
+    } = this
+    const key = appPath + filename + ext
+    const verlink = plink.serialize({ drive: this.drive.core })
+
+    this.emit('app', {
+      app: filename,
+      name,
+      version,
+      upgrade,
+      verlink,
+      key,
+      tmp,
+      dest
+    })
+
+    const from = path.join(tmp, 'by-arch', host, 'app', filename + ext)
+    if (fs.existsSync(from) === false) {
+      throw ERR_NOT_FOUND(plink.serialize({ ...parsed, pathname: key }))
+    }
+
+    if (ext === '.msix') {
+      const MSIXManager = require('msix-manager')
+      await new MSIXManager().addPackage(from)
+      return
+    }
+
+    if (ext === '.exe') exes.add(dest)
+
+    if (isBin) {
+      try {
+        if (!this.to) fs.mkdirSync(path.dirname(dest), { recursive: true })
+        this._move(from, dest)
+      } catch (err) {
+        if (err.code === 'EACCES' || err.code === 'EPERM') {
+          throw ERR_PERMISSION_REQUIRED(`Permission denied: ${dest}\n`)
+        }
+        throw err
+      }
+
+      fs.chmodSync(dest, 0o755)
+      if (!isWindows) this._addToPath(path.join(os.homedir(), '.local', 'bin'))
+    } else {
+      try {
+        await fs.promises.rename(from, dest)
+      } catch (err) {
+        if (err.code === 'EACCES' || err.code === 'EPERM') {
+          throw ERR_PERMISSION_REQUIRED(`Permission denied: ${dest}\n`)
+        }
+        throw err
+      }
+
+      if (isLinux) await this._installLinuxApp(dest, filename, tmp, home)
+    }
+  }
+
+  async _installLinuxApp(dest, appName, tmp, home) {
     fs.chmodSync(dest, 0o755)
     const extracted = path.join(tmp, 'squashfs-root')
-    const desktopPath = this._extract(dest, extracted, tmp, appName + '.desktop')
+    const desktopPath = this._extractAppImage(dest, extracted, tmp, appName + '.desktop')
     const desktop = fs.readFileSync(desktopPath, 'utf8').replace(/^Exec=.*/m, `Exec=${dest}`)
     fs.writeFileSync(desktopPath, desktop)
 
@@ -268,7 +340,7 @@ class Install extends ReadyResource {
     )
   }
 
-  _exe(dir) {
+  _addExeToPath(dir) {
     const read = spawnSync('powershell', [
       '-NoProfile',
       '-Command',
@@ -296,7 +368,7 @@ class Install extends ReadyResource {
     return true
   }
 
-  _extract(appImage, extracted, cwd, file) {
+  _extractAppImage(appImage, extracted, cwd, file) {
     const { status } = spawnSync(appImage, ['--appimage-extract', file], { cwd })
     if (status !== 0) throw new Error('appimage-extract failed')
     const full = path.join(extracted, file)
@@ -315,7 +387,7 @@ class Install extends ReadyResource {
     }
     return exists
       ? target
-      : this._extract(appImage, extracted, cwd, path.relative(extracted, target))
+      : this._extractAppImage(appImage, extracted, cwd, path.relative(extracted, target))
   }
 
   _move(src, dst) {
@@ -356,6 +428,7 @@ class Install extends ReadyResource {
       } catch {}
       this.base = null
     }
+    this.state = null
   }
 
   _addToPath(newPath) {
