@@ -9,6 +9,7 @@ const pearBuild = require('pear-build')
 const { platform, arch, isWindows } = require('which-runtime')
 const InstallCmd = require('../cmd')
 
+const PEAR_KEY = 'pear://smw4thqaqed9iq6bae7a9cxd4fesruixgkafe38jny33ahs33igy'
 const npm = isWindows ? 'npm.cmd' : 'npm'
 const pearDev = isWindows ? 'pear.dev.cmd' : './pear.dev'
 const pearExe = isWindows ? 'pear.exe' : 'pear'
@@ -33,58 +34,11 @@ test(
       PATH: `${installDir}${path.delimiter}${process.env.PATH || ''}`
     }
     await fs.promises.mkdir(homeDir, { recursive: true })
-    // TODO: once we have an actual release on a key we can replace a big chuck
-    // and run on a published key instead of main branch
-    t.comment('clone pear')
-    await exec(t, 'git', ['clone', '--depth', '1', pearRepo, pearDir], { env })
-
-    t.comment('install pear dependencies')
-    await exec(t, npm, ['install'], { cwd: pearDir, env })
-
-    const touch = await exec(t, pearDev, ['touch', '--json'], { cwd: pearDir, env })
-    const link = findJson(touch.stdout, 'touch', 'final')?.data?.link
-    t.ok(link, `touched ${link}`)
-
-    const pkgPath = path.join(pearDir, 'package.json')
-    const pkg = JSON.parse(await fs.promises.readFile(pkgPath, 'utf8'))
-    pkg.upgrade.production = link
-    pkg.upgrade.dev = link
-    pkg.upgrade.stage = link
-    await fs.promises.writeFile(pkgPath, JSON.stringify(pkg, null, 2) + '\n')
-
-    t.comment('make pear')
-    await exec(t, npm, ['run', 'make'], { cwd: pearDir, env })
-
-    t.comment('run pear-build')
-    await pearBuild({
-      package: pkgPath,
-      [`${platform}${arch[0].toUpperCase() + arch.slice(1)}App`]: path.join(
-        pearDir,
-        'by-arch',
-        host,
-        'bin',
-        pearExe
-      ),
-      target: buildDir
-    }).done()
-
-    t.comment('stage build')
-    const stage = await exec(t, pearDev, ['stage', link, buildDir, '--json'], { cwd: pearDir, env })
-    t.ok(findJson(stage.stdout, 'stage', 'final')?.data?.success, 'staged successfully')
-
-    t.comment('seed build')
-    const seed = spawn(pearDev, ['seed', link, '--json', '--no-tty'], {
-      cwd: pearDir,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe']
-    })
-    t.teardown(() => terminate(seed))
-    await waitForJson(seed, 'seed', 'announced')
 
     t.comment('install pear')
     await fs.promises.mkdir(installDir, { recursive: true })
     let finalInstall = null
-    for await (const event of new InstallCmd({ link, to: installDir, timeout: 120_000 })) {
+    for await (const event of new InstallCmd({ link: PEAR_KEY, to: installDir, timeout: 120_000 })) {
       if (event.tag === 'final') finalInstall = event.data
     }
     t.ok(finalInstall?.success, 'installed successfully')
